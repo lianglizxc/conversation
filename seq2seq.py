@@ -2,11 +2,9 @@
 import numpy as np
 import tensorflow as tf
 import pandas as pd
-import tokenization
 from nltk.tokenize import TweetTokenizer
 import collections
-import ast
-import time
+import os
 import json
 
 
@@ -188,6 +186,7 @@ def encoder(input_ids, embeding, vocab_size, embeding_size):
 
 
 def decoder(output_ids, embeding, vocab_size, attention_define, padding_size=10, training=True):
+
     with tf.variable_scope('decoder', reuse=tf.AUTO_REUSE):
 
         batch = tf.shape(output_ids)[0]
@@ -251,7 +250,7 @@ def inferQA(questions, index2word, word_dict, tokenizer, max_input_seq=10):
     input_ids = [word_dict[i] for i in input_texts if i in word_dict]
 
     if len(input_ids) > max_input_seq:
-        raise 'sentence is too long'
+        raise Exception('sentence is too long')
 
     if len(input_ids) < max_input_seq:
         input_ids.extend([0] * (max_input_seq - len(input_ids)))
@@ -264,7 +263,7 @@ def inferQA(questions, index2word, word_dict, tokenizer, max_input_seq=10):
         sess.run(tf.global_variables_initializer())
         full_path = tf.train.latest_checkpoint('model')
         if not full_path:
-            raise 'no model file exist'
+            raise Exception('no model file exist')
 
         saver.restore(sess, full_path)
         sess.run('test_init_op', feed_dict={'input_plh:0': input_ids})
@@ -275,28 +274,16 @@ def inferQA(questions, index2word, word_dict, tokenizer, max_input_seq=10):
 
 class trainHook(tf.train.SessionRunHook):
 
-    def __init__(self, metrics_op):
-        #       dict of {name: metrics}
-        self.tensor_name = list(metrics_op.keys())
-        self.tensor_eval = list(metrics_op.values())
-        self.epoch = 0
+    def __init__(self, tensors):
+        # list of tensor name
+        self.tensors = tensors
         super().__init__()
 
     def before_run(self, run_context):
 
-        return tf.train.SessionRunArgs(self.tensor_eval)
+        return tf.train.SessionRunArgs(self.tensors)
 
-    def after_run(self, run_context, run_values):
 
-        eval_result = run_values.results
-        self.epoch += 1
-        if self.epoch % 100 == 0:
-            for i, tensor in enumerate(eval_result):
-                if isinstance(tensor,tuple):
-                    eval_result, _ = tensor
-                else:
-                    eval_result = tensor
-                print('%s is %s' % (self.tensor_name[i], eval_result))
 
 
 def build_input_fn(input_file, input_length, output_length, mode):
@@ -369,25 +356,27 @@ def model_fn(features, labels, mode, params):
 
     per_example_loss = sequence_loss(decoder_output, labels, decoder_length_mask)
     loss = tf.metrics.mean(values=per_example_loss)
+    tf.identity(loss[0], name='loss_metrics')
     total_loss = tf.reduce_mean(per_example_loss)
-
     accuracy = tf.metrics.accuracy(prediction, labels, weights=decoder_length_mask)
+    tf.identity(accuracy[0], name='accuracy_metrics')
 
     if mode == tf.estimator.ModeKeys.TRAIN:
 
-        logging_hook_train = trainHook({'total_loss': loss})
         step = tf.train.get_global_step()
+        addition_op = tf.group(loss[1], accuracy[1], name = 'addition_op')
         train_op = tf.train.AdamOptimizer().minimize(total_loss, global_step=step)
-        return tf.estimator.EstimatorSpec(mode, loss=total_loss, train_op=train_op, training_hooks=[logging_hook_train],
+        return tf.estimator.EstimatorSpec(mode, loss=total_loss, train_op=train_op,
                                           eval_metric_ops={'accuracy': accuracy, 'loss': loss})
     else:
-        logging_hook_eval = trainHook({'accuracy_eval': accuracy})
         return tf.estimator.EstimatorSpec(mode, loss=total_loss,
-                                          eval_metric_ops={'accuracy_eval': accuracy, 'loss_eval': loss},
-                                          evaluation_hooks = [logging_hook_eval])
+                                          eval_metric_ops={'accuracy_eval': accuracy, 'loss_eval': loss})
 
 
 if __name__ == '__main__':
+
+    tf.logging.set_verbosity(tf.logging.INFO)
+    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
     with open('data/vocab.json', 'r') as fp:
         word_dict = json.load(fp)
@@ -403,15 +392,19 @@ if __name__ == '__main__':
               'word_dict': word_dict,
               'attention_unit': 32,
               'embeding_size': 300,
-              'epoch': 200}
+              'epoch': 100}
 
-    estimator = tf.estimator.Estimator(model_fn, params=params, model_dir='model')
+    config = tf.estimator.RunConfig(model_dir='model',save_checkpoints_steps = 20000, log_step_count_steps=1000)
 
-    train_spec =tf.estimator.TrainSpec(input_fn=input_fn_train)
+    loghook = tf.train.LoggingTensorHook(['loss_metrics','accuracy_metrics'], every_n_iter = 1000)
+    trainhook = trainHook(['addition_op'])
 
-    eval_spec = tf.estimator.EvalSpec(input_fn=input_fn_eval, throttle_secs = 30)
-
-    tf.estimator.train_and_evaluate(estimator, train_spec, eval_spec)
+    estimator = tf.estimator.Estimator(model_fn, params=params, config = config)
+    estimator.train(input_fn_train, hooks = [loghook, trainhook])
+    # train_spec =tf.estimator.TrainSpec(input_fn=input_fn_train, hooks = [loghook])
+    # eval_spec = tf.estimator.EvalSpec(input_fn=input_fn_eval, throttle_secs = 5)
+    #
+    # tf.estimator.train_and_evaluate(estimator, train_spec, eval_spec)
 
 
 
